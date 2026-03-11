@@ -19,9 +19,13 @@ type TrackData = {
 const RACE_SECONDS = 110;
 const TOTAL_LAPS = 3;
 const SAMPLE_COUNT = 700;
-const TRACK_MODEL_FILE = "/glbmap/racetrack.glb";
-const CAR_MODEL_FILE = "/glbmap/racecar.glb";
-const CAR_FORWARD_OFFSET_Y = -Math.PI / 2;
+const MAX_DRIVE_SPEED = 28;
+const DISPLAY_TOP_SPEED = 220;
+const DISPLAY_SPEED_RESPONSE = 4.2;
+const TRACK_MODEL_FILE = "/glbmap/road.glb";
+const DECOR_TRACK_MODEL_FILE = "/glbmap/racetrack.glb";
+const CAR_MODEL_FILE = "/glbmap/2019_mercedes-benz_c63_s_amg_coupe.glb";
+const CAR_FORWARD_OFFSET_Y = 0;
 const MAP_SCALE_MULTIPLIER = 2;
 const MAP_OFFSET_X = -8;
 const MAP_OFFSET_Z = 0;
@@ -142,6 +146,33 @@ function pickGroundHit(hits: THREE.Intersection[]): THREE.Intersection | null {
   return null;
 }
 
+function pickGroundHitNearHeight(
+  hits: THREE.Intersection[],
+  preferredY: number,
+): THREE.Intersection | null {
+  let best: THREE.Intersection | null = null;
+  let bestHeightDelta = Number.POSITIVE_INFINITY;
+
+  for (const hit of hits) {
+    if (!hit.face || !(hit.object instanceof THREE.Mesh)) {
+      continue;
+    }
+    const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+    const worldNormal = hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
+    if (worldNormal.y <= 0.35) {
+      continue;
+    }
+
+    const heightDelta = Math.abs(hit.point.y - preferredY);
+    if (heightDelta < bestHeightDelta) {
+      bestHeightDelta = heightDelta;
+      best = hit;
+    }
+  }
+
+  return best ?? pickGroundHit(hits);
+}
+
 function shouldUseGroundMesh(mesh: THREE.Mesh): boolean {
   return nameMatchesTokens(mesh.name, ROAD_MESH_NAMES);
 }
@@ -161,6 +192,7 @@ export default function Home() {
     lapDistance: 0,
     timeLeft: RACE_SECONDS,
     speed: 0,
+    displaySpeed: 0,
     heading: 0,
     trackIndex: 0,
     checkpoints: [false, false, false, false],
@@ -219,26 +251,70 @@ export default function Home() {
 
     const gltfLoader = new GLTFLoader();
     const mapGroundMeshes: THREE.Mesh[] = [];
+    const allMapMeshes: THREE.Mesh[] = [];
     const groundRaycaster = new THREE.Raycaster();
     const downOrigin = new THREE.Vector3();
+    const downDirection = new THREE.Vector3(0, -1, 0);
+    let carHalfWidth = 0.7;
+    let carHalfLength = 1.15;
     let lastGroundY = 0;
     mapReadyRef.current = false;
 
-    const snapToRoad = (basePosition: THREE.Vector3): THREE.Vector3 => {
+    const getRoadHitPoint = (basePosition: THREE.Vector3): THREE.Vector3 | null => {
       if (mapGroundMeshes.length === 0) {
-        return basePosition.clone();
+        return null;
       }
 
       downOrigin.copy(basePosition).setY(basePosition.y + 60);
-      groundRaycaster.set(downOrigin, new THREE.Vector3(0, -1, 0));
+      groundRaycaster.set(downOrigin, downDirection);
       groundRaycaster.far = 160;
       const groundHits = groundRaycaster.intersectObjects(mapGroundMeshes, false);
-      const groundHit = pickGroundHit(groundHits);
+      const groundHit = pickGroundHitNearHeight(groundHits, basePosition.y);
       if (groundHit) {
         return groundHit.point.clone();
       }
 
-      return basePosition.clone();
+      return null;
+    };
+
+    const canOccupyRoad = (basePosition: THREE.Vector3, heading: number): THREE.Vector3 | null => {
+      const centerHit = getRoadHitPoint(basePosition);
+      if (!centerHit) {
+        return null;
+      }
+
+      const forward = new THREE.Vector3(Math.sin(heading), 0, Math.cos(heading));
+      const right = new THREE.Vector3(forward.z, 0, -forward.x);
+      const probeOffsets = [
+        new THREE.Vector3(),
+        right.clone().multiplyScalar(carHalfWidth),
+        right.clone().multiplyScalar(-carHalfWidth),
+        forward.clone().multiplyScalar(carHalfLength),
+        forward.clone().multiplyScalar(-carHalfLength),
+        forward.clone().multiplyScalar(carHalfLength).add(right.clone().multiplyScalar(carHalfWidth)),
+        forward.clone().multiplyScalar(carHalfLength).add(right.clone().multiplyScalar(-carHalfWidth)),
+        forward
+          .clone()
+          .multiplyScalar(-carHalfLength)
+          .add(right.clone().multiplyScalar(carHalfWidth)),
+        forward
+          .clone()
+          .multiplyScalar(-carHalfLength)
+          .add(right.clone().multiplyScalar(-carHalfWidth)),
+      ];
+
+      for (const offset of probeOffsets) {
+        const probePosition = basePosition.clone().add(offset);
+        const probeHit = getRoadHitPoint(probePosition);
+        if (!probeHit) {
+          return null;
+        }
+        if (Math.abs(probeHit.y - centerHit.y) > 0.9) {
+          return null;
+        }
+      }
+
+      return centerHit;
     };
 
     const resolveSpawnOnRoad = (
@@ -258,9 +334,9 @@ export default function Home() {
       }
 
       for (const candidate of candidates) {
-        const hit = snapToRoad(candidate);
-        if (!hit.equals(candidate) || mapGroundMeshes.length === 0) {
-          return hit;
+        const hit = getRoadHitPoint(candidate);
+        if (hit || mapGroundMeshes.length === 0) {
+          return hit ?? candidate;
         }
       }
 
@@ -302,12 +378,42 @@ export default function Home() {
           if (!(obj instanceof THREE.Mesh)) {
             return;
           }
+          allMapMeshes.push(obj);
           if (shouldUseGroundMesh(obj)) {
             mapGroundMeshes.push(obj);
           }
         });
 
+        if (mapGroundMeshes.length === 0) {
+          mapGroundMeshes.push(...allMapMeshes);
+        }
+
         scene.add(mapRoot);
+
+        // Visual-only overlay: racetrack model for appearance, not collision.
+        gltfLoader.load(
+          DECOR_TRACK_MODEL_FILE,
+          (decorGltf) => {
+            if (isDisposed) {
+              return;
+            }
+
+            const decorRoot = decorGltf.scene;
+            decorRoot.traverse((obj) => {
+              if (obj instanceof THREE.Mesh) {
+                obj.castShadow = false;
+                obj.receiveShadow = true;
+              }
+            });
+
+            decorRoot.scale.copy(mapRoot.scale);
+            decorRoot.position.copy(mapRoot.position);
+            decorRoot.position.y += 0.02;
+            scene.add(decorRoot);
+          },
+          undefined,
+          () => {},
+        );
 
         let spawnPos = startPoint.clone();
         let spawnHeading = Math.atan2(startTangent.x, startTangent.z);
@@ -369,7 +475,12 @@ export default function Home() {
         carRoot.rotation.y = CAR_FORWARD_OFFSET_Y;
 
         box.setFromObject(carRoot);
+        box.getSize(size);
         box.getCenter(center);
+        const footprintMin = Math.min(size.x, size.z);
+        const footprintMax = Math.max(size.x, size.z);
+        carHalfWidth = Math.max(0.28, footprintMin * 0.22);
+        carHalfLength = Math.max(0.5, footprintMax * 0.34);
         carRoot.position.set(-center.x, -box.min.y + 0.02, -center.z);
         kart.add(carRoot);
       },
@@ -402,6 +513,7 @@ export default function Home() {
       lapDistance: 0,
       timeLeft: RACE_SECONDS,
       speed: 0,
+      displaySpeed: 0,
       heading: Math.atan2(startTangent.x, startTangent.z),
       trackIndex: 0,
       checkpoints: [false, false, false, false],
@@ -430,10 +542,10 @@ export default function Home() {
         const accelInput = keys.has("arrowup") || keys.has("w") ? 1 : 0;
         const brakeInput = keys.has("arrowdown") || keys.has("s") ? 1 : 0;
 
-        const accel = 26;
-        const brake = 36;
-        const drag = 8;
-        const maxSpeed = 42;
+        const accel = 12;
+        const brake = 28;
+        const drag = 9;
+        const maxSpeed = MAX_DRIVE_SPEED;
 
         if (accelInput > 0) {
           game.speed += accel * dt;
@@ -456,58 +568,69 @@ export default function Home() {
           Math.cos(game.heading) * game.speed,
         );
 
-        const moveDistance = velocity.length() * dt;
-        const nextPos = game.playerPos.clone().addScaledVector(velocity, dt);
+        const moveVector = velocity.clone().multiplyScalar(dt);
+        const moveDistance = moveVector.length();
         if (moveDistance > 0) {
-          game.playerPos.copy(nextPos);
+          const steps = Math.max(1, Math.ceil(moveDistance / 0.85));
+          const step = moveVector.clone().divideScalar(steps);
+          const forwardDir = new THREE.Vector3(Math.sin(game.heading), 0, Math.cos(game.heading));
+          const rightDir = new THREE.Vector3(forwardDir.z, 0, -forwardDir.x);
+          for (let i = 0; i < steps; i += 1) {
+            const stepTarget = game.playerPos.clone().add(step);
+            if (mapGroundMeshes.length > 0) {
+              const roadPoint = canOccupyRoad(stepTarget, game.heading);
+              if (!roadPoint) {
+                game.speed = Math.min(game.speed * 0.35, 6);
+
+                // Recovery move so repeated wall contact does not permanently trap the car.
+                const recoverCandidates: THREE.Vector3[] = [
+                  game.playerPos.clone().addScaledVector(forwardDir, -0.28),
+                  game.playerPos
+                    .clone()
+                    .addScaledVector(rightDir, THREE.MathUtils.clamp(steerInput, -1, 1) * 0.24),
+                  game.playerPos.clone().addScaledVector(rightDir, 0.2),
+                  game.playerPos.clone().addScaledVector(rightDir, -0.2),
+                ];
+
+                for (const candidate of recoverCandidates) {
+                  const recoverHit = canOccupyRoad(candidate, game.heading);
+                  if (recoverHit) {
+                    game.playerPos.copy(recoverHit);
+                    lastGroundY = recoverHit.y;
+                    break;
+                  }
+                }
+                break;
+              }
+              game.playerPos.copy(roadPoint);
+              lastGroundY = roadPoint.y;
+            } else {
+              game.playerPos.copy(stepTarget);
+            }
+          }
         }
 
         if (mapGroundMeshes.length > 0) {
-          downOrigin.copy(game.playerPos).setY(game.playerPos.y + 20);
-          groundRaycaster.set(downOrigin, new THREE.Vector3(0, -1, 0));
-          groundRaycaster.far = 80;
-          const groundHits = groundRaycaster.intersectObjects(mapGroundMeshes, false);
-          const groundHit = pickGroundHit(groundHits);
-          if (groundHit) {
-            game.playerPos.y = groundHit.point.y;
-            lastGroundY = groundHit.point.y;
-          } else {
-            game.playerPos.y = lastGroundY;
-            game.speed *= 0.98;
-          }
+          game.playerPos.y = lastGroundY;
         }
 
         game.timeLeft = Math.max(0, game.timeLeft - dt);
 
         game.trackIndex = nearestTrackIndex(track, game.playerPos, game.trackIndex);
-        const center = track.samples[game.trackIndex];
         const tangent = track.tangents[game.trackIndex];
-        const normal = track.normals[game.trackIndex];
-        const toKart = game.playerPos.clone().sub(center);
-        const lateral = toKart.dot(normal);
-
-        const lockedHalfWidth = Math.max(0.4, track.roadHalfWidth - 0.5);
-        const offRoad = Math.abs(lateral) > lockedHalfWidth;
-        if (offRoad) {
-          game.speed = Math.max(game.speed - 14 * dt, 14);
-        }
-
-        const hardLimit = lockedHalfWidth;
-        const clampedLateral = THREE.MathUtils.clamp(lateral, -hardLimit, hardLimit);
-        if (clampedLateral !== lateral) {
-          game.playerPos
-            .copy(center)
-            .addScaledVector(normal, clampedLateral)
-            .addScaledVector(tangent, toKart.dot(tangent));
-          game.speed *= 0.97;
-        }
-
         const facing = Math.atan2(tangent.x, tangent.z);
         const headingDelta = Math.atan2(
           Math.sin(game.heading - facing),
           Math.cos(game.heading - facing),
         );
         game.speed -= Math.abs(headingDelta) * 2.2 * dt;
+        game.speed = THREE.MathUtils.clamp(game.speed, 0, maxSpeed);
+        const targetDisplaySpeed = (game.speed / maxSpeed) * DISPLAY_TOP_SPEED;
+        game.displaySpeed = THREE.MathUtils.lerp(
+          game.displaySpeed,
+          targetDisplaySpeed,
+          1 - Math.exp(-DISPLAY_SPEED_RESPONSE * dt),
+        );
 
         game.lapDistance = track.cumulativeLengths[game.trackIndex];
         const checkpointThresholds = [0.2, 0.45, 0.7, 0.9];
@@ -540,12 +663,12 @@ export default function Home() {
         );
         const camBack = game.playerPos
           .clone()
-          .addScaledVector(forward, -11)
-          .add(new THREE.Vector3(0, 6.2, 0));
+          .addScaledVector(forward, -6.6)
+          .add(new THREE.Vector3(0, 4.4, 0));
         const camTarget = game.playerPos
           .clone()
-          .addScaledVector(forward, 7)
-          .add(new THREE.Vector3(0, 1.8, 0));
+          .addScaledVector(forward, 4.8)
+          .add(new THREE.Vector3(0, 1.5, 0));
         camera.position.lerp(camBack, 0.16);
         camera.lookAt(camTarget);
 
@@ -559,7 +682,7 @@ export default function Home() {
           game.hudTimer = 0;
           setTimeLeft(game.timeLeft);
           setProgress((game.lapDistance / track.totalLength) * 100);
-          setSpeed(game.speed);
+          setSpeed(game.displaySpeed);
         }
       }
 
@@ -642,7 +765,7 @@ export default function Home() {
         <div className="rounded-2xl border border-white/30 bg-black/45 px-4 py-3 text-right backdrop-blur">
           <p className="text-xs uppercase tracking-[0.2em] text-zinc-100">Speed</p>
           <p className="text-xl font-black tabular-nums text-cyan-300 sm:text-2xl">
-            {(speed * 3.4).toFixed(0)} km/h
+            {speed.toFixed(0)} km/h
           </p>
         </div>
       </div>
