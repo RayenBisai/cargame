@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 
 type RaceStatus = "ready" | "racing" | "won" | "lost";
 
@@ -18,6 +19,16 @@ type TrackData = {
 const RACE_SECONDS = 110;
 const TOTAL_LAPS = 3;
 const SAMPLE_COUNT = 700;
+const TRACK_MODEL_FILE = "/glbmap/racetrack.glb";
+const CAR_MODEL_FILE = "/glbmap/racecar.glb";
+const CAR_FORWARD_OFFSET_Y = -Math.PI / 2;
+const MAP_SCALE_MULTIPLIER = 2;
+const MAP_OFFSET_X = -8;
+const MAP_OFFSET_Z = 0;
+const CAR_RIDE_HEIGHT = 0.12;
+const CAR_SCALE_MULTIPLIER = 0.5;
+const START_MARKER_NAMES = ["start", "startline", "spawn"];
+const ROAD_MESH_NAMES = ["road"];
 
 function makeTrackData(): TrackData {
   const points = [
@@ -78,39 +89,6 @@ function makeTrackData(): TrackData {
   };
 }
 
-function buildRoadGeometry(track: TrackData): THREE.BufferGeometry {
-  const positions: number[] = [];
-  const normals: number[] = [];
-  const uvs: number[] = [];
-  const indices: number[] = [];
-
-  for (let i = 0; i <= SAMPLE_COUNT; i += 1) {
-    const center = track.samples[i];
-    const side = track.normals[i];
-    const left = center.clone().addScaledVector(side, -track.roadHalfWidth);
-    const right = center.clone().addScaledVector(side, track.roadHalfWidth);
-
-    positions.push(left.x, 0.02, left.z);
-    positions.push(right.x, 0.02, right.z);
-    normals.push(0, 1, 0, 0, 1, 0);
-    uvs.push(0, i / 12, 1, i / 12);
-
-    if (i < SAMPLE_COUNT) {
-      const base = i * 2;
-      indices.push(base, base + 1, base + 2);
-      indices.push(base + 1, base + 3, base + 2);
-    }
-  }
-
-  const geometry = new THREE.BufferGeometry();
-  geometry.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
-  geometry.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
-  geometry.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
-  geometry.setIndex(indices);
-  geometry.computeBoundingSphere();
-  return geometry;
-}
-
 function nearestTrackIndex(track: TrackData, position: THREE.Vector3, hint: number): number {
   const count = SAMPLE_COUNT + 1;
   let best = hint;
@@ -129,6 +107,43 @@ function nearestTrackIndex(track: TrackData, position: THREE.Vector3, hint: numb
   }
 
   return best;
+}
+
+function findStartMarker(root: THREE.Object3D): THREE.Object3D | null {
+  let marker: THREE.Object3D | null = null;
+  root.traverse((obj) => {
+    if (marker) {
+      return;
+    }
+    const name = obj.name.toLowerCase();
+    if (START_MARKER_NAMES.some((token) => name.includes(token))) {
+      marker = obj;
+    }
+  });
+  return marker;
+}
+
+function nameMatchesTokens(name: string, tokens: string[]): boolean {
+  const lowered = name.toLowerCase();
+  return tokens.some((token) => lowered.includes(token));
+}
+
+function pickGroundHit(hits: THREE.Intersection[]): THREE.Intersection | null {
+  for (const hit of hits) {
+    if (!hit.face || !(hit.object instanceof THREE.Mesh)) {
+      continue;
+    }
+    const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
+    const worldNormal = hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
+    if (worldNormal.y > 0.35) {
+      return hit;
+    }
+  }
+  return null;
+}
+
+function shouldUseGroundMesh(mesh: THREE.Mesh): boolean {
+  return nameMatchesTokens(mesh.name, ROAD_MESH_NAMES);
 }
 
 export default function Home() {
@@ -154,6 +169,7 @@ export default function Home() {
     hudTimer: 0,
     cleanup: (() => {}) as () => void,
   });
+  const mapReadyRef = useRef(false);
 
   useEffect(() => {
     const mount = mountRef.current;
@@ -163,6 +179,7 @@ export default function Home() {
 
     const scene = new THREE.Scene();
     scene.fog = new THREE.Fog(0xa8deff, 38, 210);
+    let isDisposed = false;
 
     const camera = new THREE.PerspectiveCamera(
       72,
@@ -185,115 +202,187 @@ export default function Home() {
     scene.add(sun);
 
     const track = makeTrackData();
-
-    const grass = new THREE.Mesh(
-      new THREE.CircleGeometry(230, 72),
-      new THREE.MeshStandardMaterial({ color: 0x4eb75c }),
-    );
-    grass.rotation.x = -Math.PI / 2;
-    grass.position.y = -0.04;
-    scene.add(grass);
-
-    const road = new THREE.Mesh(
-      buildRoadGeometry(track),
-      new THREE.MeshStandardMaterial({ color: 0x34363b, roughness: 0.9, metalness: 0.03 }),
-    );
-    scene.add(road);
-
-    const centerStripeMaterial = new THREE.MeshStandardMaterial({ color: 0xffffff });
-    const curbMaterialA = new THREE.MeshStandardMaterial({ color: 0xff4f4f });
-    const curbMaterialB = new THREE.MeshStandardMaterial({ color: 0xffefef });
-
-    for (let i = 0; i < SAMPLE_COUNT; i += 9) {
-      const center = track.samples[i];
-      const tangent = track.tangents[i];
-      const normal = track.normals[i];
-
-      const stripe = new THREE.Mesh(new THREE.PlaneGeometry(0.42, 4.4), centerStripeMaterial);
-      stripe.rotation.x = -Math.PI / 2;
-      stripe.position.copy(center).add(new THREE.Vector3(0, 0.03, 0));
-      stripe.rotation.z = Math.atan2(tangent.x, tangent.z);
-      scene.add(stripe);
-
-      const curbGeometry = new THREE.BoxGeometry(0.55, 0.2, 4.8);
-      const curbMaterial = (i / 9) % 2 === 0 ? curbMaterialA : curbMaterialB;
-
-      const curbL = new THREE.Mesh(curbGeometry, curbMaterial);
-      curbL.position.copy(center).addScaledVector(normal, -track.roadHalfWidth - 0.5);
-      curbL.position.y = 0.09;
-      curbL.rotation.y = Math.atan2(tangent.x, tangent.z);
-      scene.add(curbL);
-
-      const curbR = curbL.clone();
-      curbR.position.copy(center).addScaledVector(normal, track.roadHalfWidth + 0.5);
-      scene.add(curbR);
+    const startPoint = track.samples[0].clone();
+    const startTangent = track.tangents[0];
+    const trackBounds = new THREE.Box3();
+    for (const point of track.samples) {
+      trackBounds.expandByPoint(point);
     }
-
-    const treeTrunkMat = new THREE.MeshStandardMaterial({ color: 0x7a4e2f });
-    const treeLeafMat = new THREE.MeshStandardMaterial({ color: 0x2f8f3a });
-    for (let i = 0; i < SAMPLE_COUNT; i += 18) {
-      const center = track.samples[i];
-      const normal = track.normals[i];
-      const tangent = track.tangents[i];
-
-      for (const side of [-1, 1]) {
-        const tree = new THREE.Group();
-        const trunk = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.36, 2.1, 8), treeTrunkMat);
-        trunk.position.y = 1;
-        tree.add(trunk);
-
-        const crown = new THREE.Mesh(new THREE.SphereGeometry(1.3, 10, 10), treeLeafMat);
-        crown.position.y = 2.35;
-        tree.add(crown);
-
-        tree.position
-          .copy(center)
-          .addScaledVector(normal, side * (track.roadHalfWidth + 6 + Math.random() * 3))
-          .addScaledVector(tangent, (Math.random() - 0.5) * 3);
-        scene.add(tree);
-      }
-    }
+    const trackCenter = new THREE.Vector3();
+    const trackSize = new THREE.Vector3();
+    trackBounds.getCenter(trackCenter);
+    trackBounds.getSize(trackSize);
 
     const kart = new THREE.Group();
-
-    const body = new THREE.Mesh(
-      new THREE.BoxGeometry(2.2, 0.9, 3.4),
-      new THREE.MeshStandardMaterial({ color: 0xe93d2d, roughness: 0.45 }),
-    );
-    body.position.y = 1.1;
-    kart.add(body);
-
-    const nose = new THREE.Mesh(
-      new THREE.BoxGeometry(1.5, 0.7, 1.2),
-      new THREE.MeshStandardMaterial({ color: 0xffd642 }),
-    );
-    nose.position.set(0, 1.2, 1.85);
-    kart.add(nose);
-
-    const wheelGeo = new THREE.CylinderGeometry(0.41, 0.41, 0.42, 16);
-    const wheelMat = new THREE.MeshStandardMaterial({ color: 0x1e1e1e });
-    const wheels = [
-      [-1.08, 0.45, -1.15],
-      [1.08, 0.45, -1.15],
-      [-1.08, 0.45, 1.15],
-      [1.08, 0.45, 1.15],
-    ];
-
-    for (const [x, y, z] of wheels) {
-      const wheel = new THREE.Mesh(wheelGeo, wheelMat);
-      wheel.rotation.z = Math.PI / 2;
-      wheel.position.set(x, y, z);
-      kart.add(wheel);
-    }
-
-    kart.position.set(0, 0.1, 0);
+    kart.position.set(0, CAR_RIDE_HEIGHT, 0);
     scene.add(kart);
+
+    const gltfLoader = new GLTFLoader();
+    const mapGroundMeshes: THREE.Mesh[] = [];
+    const groundRaycaster = new THREE.Raycaster();
+    const downOrigin = new THREE.Vector3();
+    let lastGroundY = 0;
+    mapReadyRef.current = false;
+
+    const snapToRoad = (basePosition: THREE.Vector3): THREE.Vector3 => {
+      if (mapGroundMeshes.length === 0) {
+        return basePosition.clone();
+      }
+
+      downOrigin.copy(basePosition).setY(basePosition.y + 60);
+      groundRaycaster.set(downOrigin, new THREE.Vector3(0, -1, 0));
+      groundRaycaster.far = 160;
+      const groundHits = groundRaycaster.intersectObjects(mapGroundMeshes, false);
+      const groundHit = pickGroundHit(groundHits);
+      if (groundHit) {
+        return groundHit.point.clone();
+      }
+
+      return basePosition.clone();
+    };
+
+    const resolveSpawnOnRoad = (
+      fallbackPosition: THREE.Vector3,
+      markerPosition?: THREE.Vector3,
+    ): THREE.Vector3 => {
+      const candidates: THREE.Vector3[] = [];
+      if (markerPosition) {
+        candidates.push(markerPosition.clone());
+      }
+      candidates.push(fallbackPosition.clone());
+
+      for (const mesh of mapGroundMeshes) {
+        const meshPos = new THREE.Vector3();
+        mesh.getWorldPosition(meshPos);
+        candidates.push(meshPos);
+      }
+
+      for (const candidate of candidates) {
+        const hit = snapToRoad(candidate);
+        if (!hit.equals(candidate) || mapGroundMeshes.length === 0) {
+          return hit;
+        }
+      }
+
+      return fallbackPosition.clone();
+    };
+
+    gltfLoader.load(
+      TRACK_MODEL_FILE,
+      (gltf) => {
+        if (isDisposed) {
+          return;
+        }
+        const mapRoot = gltf.scene;
+        mapRoot.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) {
+            obj.castShadow = false;
+            obj.receiveShadow = true;
+          }
+        });
+
+        const mapBounds = new THREE.Box3().setFromObject(mapRoot);
+        const mapSize = new THREE.Vector3();
+        mapBounds.getSize(mapSize);
+        const mapSpan = Math.max(mapSize.x, mapSize.z, 0.001);
+        const trackSpan = Math.max(trackSize.x, trackSize.z, 0.001);
+        const mapScale = (trackSpan / mapSpan) * MAP_SCALE_MULTIPLIER;
+        mapRoot.scale.setScalar(mapScale);
+
+        mapBounds.setFromObject(mapRoot);
+        const mapCenter = new THREE.Vector3();
+        mapBounds.getCenter(mapCenter);
+        mapRoot.position.set(
+          trackCenter.x - mapCenter.x + MAP_OFFSET_X,
+          -mapBounds.min.y,
+          trackCenter.z - mapCenter.z + MAP_OFFSET_Z,
+        );
+
+        mapRoot.traverse((obj) => {
+          if (!(obj instanceof THREE.Mesh)) {
+            return;
+          }
+          if (shouldUseGroundMesh(obj)) {
+            mapGroundMeshes.push(obj);
+          }
+        });
+
+        scene.add(mapRoot);
+
+        let spawnPos = startPoint.clone();
+        let spawnHeading = Math.atan2(startTangent.x, startTangent.z);
+        let markerPosForSnap: THREE.Vector3 | undefined;
+        const startMarker = findStartMarker(mapRoot);
+        if (startMarker) {
+          const markerPos = new THREE.Vector3();
+          const markerRot = new THREE.Quaternion();
+          const markerForward = new THREE.Vector3();
+          startMarker.getWorldPosition(markerPos);
+          startMarker.getWorldQuaternion(markerRot);
+          markerForward.set(0, 0, 1).applyQuaternion(markerRot);
+          const markerHeading = Math.atan2(markerForward.x, markerForward.z);
+          spawnPos = markerPos;
+          markerPosForSnap = markerPos.clone();
+          spawnHeading = markerHeading;
+        }
+
+        spawnPos = resolveSpawnOnRoad(spawnPos, markerPosForSnap);
+
+        gameRef.current.playerPos.copy(spawnPos);
+        gameRef.current.heading = spawnHeading;
+        gameRef.current.trackIndex = nearestTrackIndex(track, spawnPos, 0);
+        gameRef.current.lapDistance = track.cumulativeLengths[gameRef.current.trackIndex];
+        lastGroundY = spawnPos.y;
+
+        kart.position.copy(spawnPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
+        kart.rotation.y = spawnHeading;
+        mapReadyRef.current = true;
+      },
+      undefined,
+      () => {},
+    );
+
+    gltfLoader.load(
+      CAR_MODEL_FILE,
+      (gltf) => {
+        if (isDisposed) {
+          return;
+        }
+
+        const carRoot = gltf.scene;
+        carRoot.traverse((obj) => {
+          if (obj instanceof THREE.Mesh) {
+            obj.castShadow = false;
+            obj.receiveShadow = true;
+          }
+        });
+
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        const box = new THREE.Box3().setFromObject(carRoot);
+        box.getSize(size);
+
+        const baseSize = Math.max(size.x, size.z, size.y, 0.001);
+        const targetLength = track.roadHalfWidth * 0.9;
+        const scale = (targetLength / baseSize) * CAR_SCALE_MULTIPLIER;
+        carRoot.scale.setScalar(scale);
+        carRoot.rotation.y = CAR_FORWARD_OFFSET_Y;
+
+        box.setFromObject(carRoot);
+        box.getCenter(center);
+        carRoot.position.set(-center.x, -box.min.y + 0.02, -center.z);
+        kart.add(carRoot);
+      },
+      undefined,
+      () => {},
+    );
 
     const keys = new Set<string>();
 
     const onKeyDown = (event: KeyboardEvent) => {
-      keys.add(event.key.toLowerCase());
-      if (gameRef.current.status === "ready") {
+      const key = event.key.toLowerCase();
+      keys.add(key);
+      if (gameRef.current.status === "ready" && mapReadyRef.current) {
         gameRef.current.status = "racing";
         setStatus("racing");
       }
@@ -305,9 +394,6 @@ export default function Home() {
 
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
-
-    const startPoint = track.samples[0].clone();
-    const startTangent = track.tangents[0];
 
     gameRef.current = {
       ...gameRef.current,
@@ -324,8 +410,9 @@ export default function Home() {
       hudTimer: 0,
       cleanup: () => {},
     };
+    lastGroundY = startPoint.y;
 
-    kart.position.copy(startPoint).add(new THREE.Vector3(0, 0.12, 0));
+    kart.position.copy(startPoint).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
 
     let frameId = 0;
     let prev = performance.now();
@@ -369,7 +456,27 @@ export default function Home() {
           Math.cos(game.heading) * game.speed,
         );
 
-        game.playerPos.addScaledVector(velocity, dt);
+        const moveDistance = velocity.length() * dt;
+        const nextPos = game.playerPos.clone().addScaledVector(velocity, dt);
+        if (moveDistance > 0) {
+          game.playerPos.copy(nextPos);
+        }
+
+        if (mapGroundMeshes.length > 0) {
+          downOrigin.copy(game.playerPos).setY(game.playerPos.y + 20);
+          groundRaycaster.set(downOrigin, new THREE.Vector3(0, -1, 0));
+          groundRaycaster.far = 80;
+          const groundHits = groundRaycaster.intersectObjects(mapGroundMeshes, false);
+          const groundHit = pickGroundHit(groundHits);
+          if (groundHit) {
+            game.playerPos.y = groundHit.point.y;
+            lastGroundY = groundHit.point.y;
+          } else {
+            game.playerPos.y = lastGroundY;
+            game.speed *= 0.98;
+          }
+        }
+
         game.timeLeft = Math.max(0, game.timeLeft - dt);
 
         game.trackIndex = nearestTrackIndex(track, game.playerPos, game.trackIndex);
@@ -379,12 +486,13 @@ export default function Home() {
         const toKart = game.playerPos.clone().sub(center);
         const lateral = toKart.dot(normal);
 
-        const offRoad = Math.abs(lateral) > track.roadHalfWidth;
+        const lockedHalfWidth = Math.max(0.4, track.roadHalfWidth - 0.5);
+        const offRoad = Math.abs(lateral) > lockedHalfWidth;
         if (offRoad) {
           game.speed = Math.max(game.speed - 14 * dt, 14);
         }
 
-        const hardLimit = track.roadHalfWidth + 2.8;
+        const hardLimit = lockedHalfWidth;
         const clampedLateral = THREE.MathUtils.clamp(lateral, -hardLimit, hardLimit);
         if (clampedLateral !== lateral) {
           game.playerPos
@@ -421,7 +529,7 @@ export default function Home() {
         }
         game.lastNearStart = nearStart;
 
-        kart.position.copy(game.playerPos).add(new THREE.Vector3(0, 0.12, 0));
+        kart.position.copy(game.playerPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
         kart.rotation.y = game.heading;
         kart.rotation.z = -steerInput * 0.08;
 
@@ -473,6 +581,8 @@ export default function Home() {
     window.addEventListener("resize", onResize);
 
     gameRef.current.cleanup = () => {
+      isDisposed = true;
+      mapReadyRef.current = false;
       cancelAnimationFrame(frameId);
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
