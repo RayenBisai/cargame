@@ -25,6 +25,7 @@ const CAR_RIDE_HEIGHT = 0.12;
 const CAR_SCALE_MULTIPLIER = 0.5;
 const START_MARKER_NAMES = ["start", "startline", "spawn"];
 const ROAD_MESH_NAMES = ["road"];
+const WALL_SLOWDOWN_RATE = 4.8;
 
 function shouldUseGroundMesh(mesh: THREE.Mesh): boolean {
   return nameMatchesTokens(mesh.name, ROAD_MESH_NAMES);
@@ -46,6 +47,7 @@ export default function Home() {
     timeLeft: RACE_SECONDS,
     speed: 0,
     displaySpeed: 0,
+    steer: 0,
     heading: 0,
     trackIndex: 0,
     checkpoints: [false, false, false, false],
@@ -384,6 +386,7 @@ export default function Home() {
       timeLeft: RACE_SECONDS,
       speed: 0,
       displaySpeed: 0,
+      steer: 0,
       heading: Math.atan2(startTangent.x, startTangent.z),
       trackIndex: 0,
       checkpoints: [false, false, false, false],
@@ -408,13 +411,16 @@ export default function Home() {
         const steerInput =
           (keys.has("arrowright") || keys.has("a") ? 1 : 0) -
           (keys.has("arrowleft") || keys.has("d") ? 1 : 0);
+        const steerResponse = steerInput === 0 ? 9.5 : 4.6;
+        const steerAlpha = 1 - Math.exp(-steerResponse * dt);
+        game.steer = THREE.MathUtils.lerp(game.steer, steerInput, steerAlpha);
 
         const accelInput = keys.has("arrowup") || keys.has("w") ? 1 : 0;
         const brakeInput = keys.has("arrowdown") || keys.has("s") ? 1 : 0;
         const maxSpeed = MAX_DRIVE_SPEED;
         
         game.speed = updateCarSpeed(game.speed, accelInput, brakeInput, dt, DEFAULT_PHYSICS);
-        game.heading = updateCarHeading(game.heading, steerInput, game.speed, dt, DEFAULT_PHYSICS);
+        game.heading = updateCarHeading(game.heading, game.steer, game.speed, dt, DEFAULT_PHYSICS);
         const velocity = calculateVelocity(game.heading, game.speed);
         const moveVector = velocity.clone().multiplyScalar(dt);
         const moveDistance = moveVector.length();
@@ -428,25 +434,38 @@ export default function Home() {
             if (mapGroundMeshes.length > 0) {
               const roadPoint = canOccupyRoad(stepTarget, game.heading);
               if (!roadPoint) {
-                game.speed = Math.min(game.speed * 0.35, 6);
+                // Smoothly lose speed on wall contact instead of hard-braking to near-zero.
+                const wallSlowdown = Math.exp(-WALL_SLOWDOWN_RATE * dt);
+                game.speed = Math.max(0, game.speed * wallSlowdown);
+
+                const steerSign = Math.sign(game.steer);
                 const recoverCandidates: THREE.Vector3[] = [
-                  game.playerPos.clone().addScaledVector(forwardDir, -0.28),
                   game.playerPos
                     .clone()
-                    .addScaledVector(rightDir, THREE.MathUtils.clamp(steerInput, -1, 1) * 0.24),
+                    .addScaledVector(forwardDir, 0.2)
+                    .addScaledVector(rightDir, -steerSign * 0.18),
+                  game.playerPos.clone().addScaledVector(forwardDir, 0.18),
                   game.playerPos.clone().addScaledVector(rightDir, 0.2),
                   game.playerPos.clone().addScaledVector(rightDir, -0.2),
+                  game.playerPos.clone().addScaledVector(forwardDir, -0.16),
                 ];
 
+                let recovered = false;
                 for (const candidate of recoverCandidates) {
                   const recoverHit = canOccupyRoad(candidate, game.heading);
-                  if (recoverHit) {
-                    game.playerPos.copy(recoverHit);
-                    lastGroundY = recoverHit.y;
-                    break;
+                  if (!recoverHit) {
+                    continue;
                   }
+                  game.playerPos.lerp(recoverHit, 0.55);
+                  lastGroundY = recoverHit.y;
+                  recovered = true;
+                  break;
                 }
-                break;
+
+                if (!recovered) {
+                  break;
+                }
+                continue;
               }
               game.playerPos.lerp(roadPoint, 0.75);
               lastGroundY = roadPoint.y;
@@ -495,9 +514,9 @@ export default function Home() {
 
         kart.position.copy(game.playerPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
         kart.rotation.y = game.heading;
-        kart.rotation.z = -steerInput * 0.08;
+        kart.rotation.z = -game.steer * 0.08;
 
-        updateCamera(camera, game.playerPos, game.heading, game.speed, maxSpeed);
+        updateCamera(camera, game.playerPos, game.heading, game.speed, maxSpeed, game.steer, dt);
 
         if (game.timeLeft <= 0) {
           game.status = "lost";

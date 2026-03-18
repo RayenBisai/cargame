@@ -47,7 +47,7 @@ export function updateCarHeading(
   dt: number,
   config: PhysicsConfig
 ): number {
-  return heading + steerInput * config.steerRate * dt * (0.35 + speed / config.maxSpeed);
+  return heading + steerInput * config.steerRate * dt * (0.25 + speed / config.maxSpeed);
 }
 
 export function calculateVelocity(heading: number, speed: number): THREE.Vector3 {
