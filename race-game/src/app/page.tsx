@@ -3,23 +3,15 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-
-type RaceStatus = "ready" | "racing" | "won" | "lost";
-
-type TrackData = {
-  curve: THREE.CatmullRomCurve3;
-  samples: THREE.Vector3[];
-  tangents: THREE.Vector3[];
-  normals: THREE.Vector3[];
-  cumulativeLengths: number[];
-  totalLength: number;
-  roadHalfWidth: number;
-};
+import { RaceStatus, TrackData, GameState } from "./types";
+import { makeTrackData, nearestTrackIndex, SAMPLE_COUNT } from "./track";
+import { pickGroundHit, pickGroundHitNearHeight, findStartMarker, nameMatchesTokens } from "./collision";
+import { DEFAULT_PHYSICS, updateCarSpeed, updateCarHeading, calculateVelocity } from "./physics";
+import { updateCamera } from "./camera";
 
 const RACE_SECONDS = 110;
 const TOTAL_LAPS = 3;
-const SAMPLE_COUNT = 700;
-const MAX_DRIVE_SPEED = 28;
+const MAX_DRIVE_SPEED = 38;
 const DISPLAY_TOP_SPEED = 220;
 const DISPLAY_SPEED_RESPONSE = 4.2;
 const TRACK_MODEL_FILE = "/glbmap/road.glb";
@@ -33,145 +25,6 @@ const CAR_RIDE_HEIGHT = 0.12;
 const CAR_SCALE_MULTIPLIER = 0.5;
 const START_MARKER_NAMES = ["start", "startline", "spawn"];
 const ROAD_MESH_NAMES = ["road"];
-
-function makeTrackData(): TrackData {
-  const points = [
-    new THREE.Vector3(0, 0, 0),
-    new THREE.Vector3(24, 0, -16),
-    new THREE.Vector3(58, 0, -12),
-    new THREE.Vector3(82, 0, 18),
-    new THREE.Vector3(70, 0, 58),
-    new THREE.Vector3(36, 0, 78),
-    new THREE.Vector3(-6, 0, 66),
-    new THREE.Vector3(-44, 0, 76),
-    new THREE.Vector3(-78, 0, 48),
-    new THREE.Vector3(-86, 0, 10),
-    new THREE.Vector3(-66, 0, -28),
-    new THREE.Vector3(-28, 0, -34),
-  ];
-
-  const curve = new THREE.CatmullRomCurve3(points, true, "catmullrom", 0.2);
-  const samples: THREE.Vector3[] = [];
-  const tangents: THREE.Vector3[] = [];
-  const normals: THREE.Vector3[] = [];
-  const cumulativeLengths: number[] = [0];
-
-  let totalLength = 0;
-  let prevPoint = curve.getPointAt(0);
-  let prevTangent = curve.getTangentAt(0).normalize();
-
-  for (let i = 0; i <= SAMPLE_COUNT; i += 1) {
-    const t = i / SAMPLE_COUNT;
-    const point = curve.getPointAt(t);
-    const tangent = curve.getTangentAt(t).normalize();
-    const normal = new THREE.Vector3(-tangent.z, 0, tangent.x).normalize();
-
-    if (i > 0) {
-      totalLength += point.distanceTo(prevPoint);
-      cumulativeLengths.push(totalLength);
-
-      if (tangent.dot(prevTangent) < 0) {
-        tangent.multiplyScalar(-1);
-      }
-    }
-
-    samples.push(point);
-    tangents.push(tangent);
-    normals.push(normal);
-    prevPoint = point;
-    prevTangent = tangent;
-  }
-
-  return {
-    curve,
-    samples,
-    tangents,
-    normals,
-    cumulativeLengths,
-    totalLength,
-    roadHalfWidth: 7,
-  };
-}
-
-function nearestTrackIndex(track: TrackData, position: THREE.Vector3, hint: number): number {
-  const count = SAMPLE_COUNT + 1;
-  let best = hint;
-  let bestDistSq = Number.POSITIVE_INFINITY;
-
-  for (let offset = -26; offset <= 26; offset += 1) {
-    const i = (hint + offset + count) % count;
-    const p = track.samples[i];
-    const dx = position.x - p.x;
-    const dz = position.z - p.z;
-    const distSq = dx * dx + dz * dz;
-    if (distSq < bestDistSq) {
-      bestDistSq = distSq;
-      best = i;
-    }
-  }
-
-  return best;
-}
-
-function findStartMarker(root: THREE.Object3D): THREE.Object3D | null {
-  let marker: THREE.Object3D | null = null;
-  root.traverse((obj) => {
-    if (marker) {
-      return;
-    }
-    const name = obj.name.toLowerCase();
-    if (START_MARKER_NAMES.some((token) => name.includes(token))) {
-      marker = obj;
-    }
-  });
-  return marker;
-}
-
-function nameMatchesTokens(name: string, tokens: string[]): boolean {
-  const lowered = name.toLowerCase();
-  return tokens.some((token) => lowered.includes(token));
-}
-
-function pickGroundHit(hits: THREE.Intersection[]): THREE.Intersection | null {
-  for (const hit of hits) {
-    if (!hit.face || !(hit.object instanceof THREE.Mesh)) {
-      continue;
-    }
-    const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
-    const worldNormal = hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
-    if (worldNormal.y > 0.35) {
-      return hit;
-    }
-  }
-  return null;
-}
-
-function pickGroundHitNearHeight(
-  hits: THREE.Intersection[],
-  preferredY: number,
-): THREE.Intersection | null {
-  let best: THREE.Intersection | null = null;
-  let bestHeightDelta = Number.POSITIVE_INFINITY;
-
-  for (const hit of hits) {
-    if (!hit.face || !(hit.object instanceof THREE.Mesh)) {
-      continue;
-    }
-    const normalMatrix = new THREE.Matrix3().getNormalMatrix(hit.object.matrixWorld);
-    const worldNormal = hit.face.normal.clone().applyMatrix3(normalMatrix).normalize();
-    if (worldNormal.y <= 0.35) {
-      continue;
-    }
-
-    const heightDelta = Math.abs(hit.point.y - preferredY);
-    if (heightDelta < bestHeightDelta) {
-      bestHeightDelta = heightDelta;
-      best = hit;
-    }
-  }
-
-  return best ?? pickGroundHit(hits);
-}
 
 function shouldUseGroundMesh(mesh: THREE.Mesh): boolean {
   return nameMatchesTokens(mesh.name, ROAD_MESH_NAMES);
@@ -210,7 +63,8 @@ export default function Home() {
     }
 
     const scene = new THREE.Scene();
-    scene.fog = new THREE.Fog(0xa8deff, 38, 210);
+    scene.background = new THREE.Color(0x87ceeb); // Sky blue
+    scene.fog = new THREE.Fog(0x87ceeb, 38, 210);
     let isDisposed = false;
 
     const camera = new THREE.PerspectiveCamera(
@@ -226,11 +80,14 @@ export default function Home() {
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     mount.appendChild(renderer.domElement);
 
-    const hemi = new THREE.HemisphereLight(0xc4f8ff, 0x287042, 1.15);
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x8866ff, 0.6);
     scene.add(hemi);
 
-    const sun = new THREE.DirectionalLight(0xffefb0, 1.2);
+    const sun = new THREE.DirectionalLight(0xffffff, 1.4);
     sun.position.set(18, 28, 10);
+    sun.castShadow = true;
+    sun.shadow.mapSize.width = 2048;
+    sun.shadow.mapSize.height = 2048;
     scene.add(sun);
 
     const track = makeTrackData();
@@ -418,7 +275,7 @@ export default function Home() {
         let spawnPos = startPoint.clone();
         let spawnHeading = Math.atan2(startTangent.x, startTangent.z);
         let markerPosForSnap: THREE.Vector3 | undefined;
-        const startMarker = findStartMarker(mapRoot);
+        const startMarker = findStartMarker(mapRoot, START_MARKER_NAMES);
         if (startMarker) {
           const markerPos = new THREE.Vector3();
           const markerRot = new THREE.Quaternion();
@@ -439,6 +296,19 @@ export default function Home() {
         gameRef.current.trackIndex = nearestTrackIndex(track, spawnPos, 0);
         gameRef.current.lapDistance = track.cumulativeLengths[gameRef.current.trackIndex];
         lastGroundY = spawnPos.y;
+
+        // Add small directional arrow above spawn point
+        const arrowGeo = new THREE.ConeGeometry(0.6, 1.5, 8);
+        const arrowMat = new THREE.MeshStandardMaterial({
+          color: 0x00ff00,
+          emissive: 0x00ff00,
+          emissiveIntensity: 2
+        });
+        const arrow = new THREE.Mesh(arrowGeo, arrowMat);
+        arrow.position.copy(spawnPos).add(new THREE.Vector3(0, 3, 0));
+        arrow.rotation.x = Math.PI / 2;
+        arrow.rotation.z = spawnHeading;
+        scene.add(arrow);
 
         kart.position.copy(spawnPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
         kart.rotation.y = spawnHeading;
@@ -541,37 +411,15 @@ export default function Home() {
 
         const accelInput = keys.has("arrowup") || keys.has("w") ? 1 : 0;
         const brakeInput = keys.has("arrowdown") || keys.has("s") ? 1 : 0;
-
-        const accel = 12;
-        const brake = 28;
-        const drag = 9;
         const maxSpeed = MAX_DRIVE_SPEED;
-
-        if (accelInput > 0) {
-          game.speed += accel * dt;
-        } else {
-          game.speed -= drag * dt;
-        }
-
-        if (brakeInput > 0) {
-          game.speed -= brake * dt;
-        }
-
-        game.speed = THREE.MathUtils.clamp(game.speed, 0, maxSpeed);
-
-        const steerRate = 2.1;
-        game.heading += steerInput * steerRate * dt * (0.35 + game.speed / maxSpeed);
-
-        const velocity = new THREE.Vector3(
-          Math.sin(game.heading) * game.speed,
-          0,
-          Math.cos(game.heading) * game.speed,
-        );
-
+        
+        game.speed = updateCarSpeed(game.speed, accelInput, brakeInput, dt, DEFAULT_PHYSICS);
+        game.heading = updateCarHeading(game.heading, steerInput, game.speed, dt, DEFAULT_PHYSICS);
+        const velocity = calculateVelocity(game.heading, game.speed);
         const moveVector = velocity.clone().multiplyScalar(dt);
         const moveDistance = moveVector.length();
         if (moveDistance > 0) {
-          const steps = Math.max(1, Math.ceil(moveDistance / 0.85));
+          const steps = Math.max(1, Math.ceil(moveDistance / 3.5));
           const step = moveVector.clone().divideScalar(steps);
           const forwardDir = new THREE.Vector3(Math.sin(game.heading), 0, Math.cos(game.heading));
           const rightDir = new THREE.Vector3(forwardDir.z, 0, -forwardDir.x);
@@ -581,8 +429,6 @@ export default function Home() {
               const roadPoint = canOccupyRoad(stepTarget, game.heading);
               if (!roadPoint) {
                 game.speed = Math.min(game.speed * 0.35, 6);
-
-                // Recovery move so repeated wall contact does not permanently trap the car.
                 const recoverCandidates: THREE.Vector3[] = [
                   game.playerPos.clone().addScaledVector(forwardDir, -0.28),
                   game.playerPos
@@ -602,7 +448,7 @@ export default function Home() {
                 }
                 break;
               }
-              game.playerPos.copy(roadPoint);
+              game.playerPos.lerp(roadPoint, 0.75);
               lastGroundY = roadPoint.y;
             } else {
               game.playerPos.copy(stepTarget);
@@ -610,12 +456,7 @@ export default function Home() {
           }
         }
 
-        if (mapGroundMeshes.length > 0) {
-          game.playerPos.y = lastGroundY;
-        }
-
         game.timeLeft = Math.max(0, game.timeLeft - dt);
-
         game.trackIndex = nearestTrackIndex(track, game.playerPos, game.trackIndex);
         const tangent = track.tangents[game.trackIndex];
         const facing = Math.atan2(tangent.x, tangent.z);
@@ -656,21 +497,7 @@ export default function Home() {
         kart.rotation.y = game.heading;
         kart.rotation.z = -steerInput * 0.08;
 
-        const forward = new THREE.Vector3(
-          Math.sin(game.heading),
-          0,
-          Math.cos(game.heading),
-        );
-        const camBack = game.playerPos
-          .clone()
-          .addScaledVector(forward, -6.6)
-          .add(new THREE.Vector3(0, 4.4, 0));
-        const camTarget = game.playerPos
-          .clone()
-          .addScaledVector(forward, 4.8)
-          .add(new THREE.Vector3(0, 1.5, 0));
-        camera.position.lerp(camBack, 0.16);
-        camera.lookAt(camTarget);
+        updateCamera(camera, game.playerPos, game.heading, game.speed, maxSpeed);
 
         if (game.timeLeft <= 0) {
           game.status = "lost";
