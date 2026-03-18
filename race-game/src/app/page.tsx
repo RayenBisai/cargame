@@ -3,29 +3,39 @@
 import { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
-import { RaceStatus, TrackData, GameState } from "./types";
+import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
+import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
+import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
+import { OutputPass } from "three/examples/jsm/postprocessing/OutputPass.js";
+import { RaceStatus } from "./types";
 import { makeTrackData, nearestTrackIndex, SAMPLE_COUNT } from "./track";
-import { pickGroundHit, pickGroundHitNearHeight, findStartMarker, nameMatchesTokens } from "./collision";
+import { pickGroundHitNearHeight, findStartMarker, nameMatchesTokens } from "./collision";
 import { DEFAULT_PHYSICS, updateCarSpeed, updateCarHeading, calculateVelocity } from "./physics";
 import { updateCamera } from "./camera";
-
-const RACE_SECONDS = 110;
-const TOTAL_LAPS = 3;
-const MAX_DRIVE_SPEED = 38;
-const DISPLAY_TOP_SPEED = 220;
-const DISPLAY_SPEED_RESPONSE = 4.2;
-const TRACK_MODEL_FILE = "/glbmap/road.glb";
-const DECOR_TRACK_MODEL_FILE = "/glbmap/racetrack.glb";
-const CAR_MODEL_FILE = "/glbmap/2019_mercedes-benz_c63_s_amg_coupe.glb";
-const CAR_FORWARD_OFFSET_Y = 0;
-const MAP_SCALE_MULTIPLIER = 2;
-const MAP_OFFSET_X = -8;
-const MAP_OFFSET_Z = 0;
-const CAR_RIDE_HEIGHT = 0.12;
-const CAR_SCALE_MULTIPLIER = 0.5;
-const START_MARKER_NAMES = ["start", "startline", "spawn"];
-const ROAD_MESH_NAMES = ["road"];
-const WALL_SLOWDOWN_RATE = 4.8;
+import {
+  RACE_SECONDS,
+  TOTAL_LAPS,
+  MAX_DRIVE_SPEED,
+  DISPLAY_TOP_SPEED,
+  DISPLAY_SPEED_RESPONSE,
+  TRACK_MODEL_FILE,
+  DECOR_TRACK_MODEL_FILE,
+  SPAWN_MARKER_MODEL_FILE,
+  CAR_MODEL_FILE,
+  CAR_FORWARD_OFFSET_Y,
+  MAP_SCALE_MULTIPLIER,
+  MAP_OFFSET_X,
+  MAP_OFFSET_Z,
+  CAR_RIDE_HEIGHT,
+  CAR_SCALE_MULTIPLIER,
+  START_MARKER_NAMES,
+  ROAD_MESH_NAMES,
+  WALL_SLOWDOWN_RATE,
+  MIN_STEER_SPEED,
+  LAP_DISTANCE_THRESHOLD_FACTOR,
+} from "./gameConfig";
+import { createInitialGameState, RuntimeGameState } from "./gameState";
+import { SpeedTunnelBlurShader, updateSpeedBlurAmount } from "./postfx";
 
 function shouldUseGroundMesh(mesh: THREE.Mesh): boolean {
   return nameMatchesTokens(mesh.name, ROAD_MESH_NAMES);
@@ -40,22 +50,7 @@ export default function Home() {
   const [progress, setProgress] = useState(0);
   const [speed, setSpeed] = useState(0);
 
-  const gameRef = useRef({
-    status: "ready" as RaceStatus,
-    lap: 1,
-    lapDistance: 0,
-    timeLeft: RACE_SECONDS,
-    speed: 0,
-    displaySpeed: 0,
-    steer: 0,
-    heading: 0,
-    trackIndex: 0,
-    checkpoints: [false, false, false, false],
-    lastNearStart: false,
-    playerPos: new THREE.Vector3(),
-    hudTimer: 0,
-    cleanup: (() => {}) as () => void,
-  });
+  const gameRef = useRef<RuntimeGameState>(createInitialGameState(new THREE.Vector3(), 0));
   const mapReadyRef = useRef(false);
 
   useEffect(() => {
@@ -81,6 +76,16 @@ export default function Home() {
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
     renderer.outputColorSpace = THREE.SRGBColorSpace;
     mount.appendChild(renderer.domElement);
+
+    const composer = new EffectComposer(renderer);
+    composer.setSize(mount.clientWidth, mount.clientHeight);
+    const renderPass = new RenderPass(scene, camera);
+    composer.addPass(renderPass);
+    const speedBlurPass = new ShaderPass(SpeedTunnelBlurShader);
+    speedBlurPass.uniforms.amount.value = 0;
+    composer.addPass(speedBlurPass);
+    const outputPass = new OutputPass();
+    composer.addPass(outputPass);
 
     const hemi = new THREE.HemisphereLight(0xffffff, 0x8866ff, 0.6);
     scene.add(hemi);
@@ -116,7 +121,6 @@ export default function Home() {
     const downDirection = new THREE.Vector3(0, -1, 0);
     let carHalfWidth = 0.7;
     let carHalfLength = 1.15;
-    let lastGroundY = 0;
     mapReadyRef.current = false;
 
     const getRoadHitPoint = (basePosition: THREE.Vector3): THREE.Vector3 | null => {
@@ -277,8 +281,13 @@ export default function Home() {
         let spawnPos = startPoint.clone();
         let spawnHeading = Math.atan2(startTangent.x, startTangent.z);
         let markerPosForSnap: THREE.Vector3 | undefined;
-        const startMarker = findStartMarker(mapRoot, START_MARKER_NAMES);
-        if (startMarker) {
+
+        const applySpawnFromRoot = (root: THREE.Object3D): boolean => {
+          const startMarker = findStartMarker(root, START_MARKER_NAMES);
+          if (!startMarker) {
+            return false;
+          }
+
           const markerPos = new THREE.Vector3();
           const markerRot = new THREE.Quaternion();
           const markerForward = new THREE.Vector3();
@@ -289,32 +298,68 @@ export default function Home() {
           spawnPos = markerPos;
           markerPosForSnap = markerPos.clone();
           spawnHeading = markerHeading;
+          return true;
+        };
+
+        const finalizeSpawn = () => {
+          const resolvedSpawnPos = resolveSpawnOnRoad(spawnPos, markerPosForSnap);
+          const spawnTrackIndex = nearestTrackIndex(track, resolvedSpawnPos, 0);
+          const spawnTangent = track.tangents[spawnTrackIndex];
+          const trackHeading = Math.atan2(spawnTangent.x, spawnTangent.z);
+          spawnHeading = trackHeading + Math.PI;
+          const headingForward = new THREE.Vector3(Math.sin(spawnHeading), 0, Math.cos(spawnHeading));
+          const tangentForward = new THREE.Vector3(spawnTangent.x, 0, spawnTangent.z).normalize();
+          const lapDirection = headingForward.dot(tangentForward) >= 0 ? 1 : -1;
+
+          gameRef.current.playerPos.copy(resolvedSpawnPos);
+          gameRef.current.heading = spawnHeading;
+          gameRef.current.trackIndex = spawnTrackIndex;
+          gameRef.current.lapStartIndex = spawnTrackIndex;
+          gameRef.current.lapStartDistance = track.cumulativeLengths[spawnTrackIndex];
+          gameRef.current.lapDirection = lapDirection;
+          gameRef.current.lapDistance = 0;
+          gameRef.current.lapTravel = 0;
+
+          // Add small directional arrow above spawn point
+          const arrowGeo = new THREE.ConeGeometry(0.6, 1.5, 8);
+          const arrowMat = new THREE.MeshStandardMaterial({
+            color: 0x00ff00,
+            emissive: 0x00ff00,
+            emissiveIntensity: 2
+          });
+          const arrow = new THREE.Mesh(arrowGeo, arrowMat);
+          arrow.position.copy(resolvedSpawnPos).add(new THREE.Vector3(0, 3, 0));
+          arrow.rotation.set(Math.PI / 2, spawnHeading, 0);
+          scene.add(arrow);
+
+          kart.position.copy(resolvedSpawnPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
+          kart.rotation.y = spawnHeading;
+          mapReadyRef.current = true;
+        };
+
+        if (applySpawnFromRoot(mapRoot)) {
+          finalizeSpawn();
+        } else {
+          gltfLoader.load(
+            SPAWN_MARKER_MODEL_FILE,
+            (spawnGltf) => {
+              if (isDisposed) {
+                return;
+              }
+
+              const spawnRoot = spawnGltf.scene;
+              spawnRoot.scale.copy(mapRoot.scale);
+              spawnRoot.position.copy(mapRoot.position);
+              spawnRoot.updateMatrixWorld(true);
+              applySpawnFromRoot(spawnRoot);
+              finalizeSpawn();
+            },
+            undefined,
+            () => {
+              finalizeSpawn();
+            },
+          );
         }
-
-        spawnPos = resolveSpawnOnRoad(spawnPos, markerPosForSnap);
-
-        gameRef.current.playerPos.copy(spawnPos);
-        gameRef.current.heading = spawnHeading;
-        gameRef.current.trackIndex = nearestTrackIndex(track, spawnPos, 0);
-        gameRef.current.lapDistance = track.cumulativeLengths[gameRef.current.trackIndex];
-        lastGroundY = spawnPos.y;
-
-        // Add small directional arrow above spawn point
-        const arrowGeo = new THREE.ConeGeometry(0.6, 1.5, 8);
-        const arrowMat = new THREE.MeshStandardMaterial({
-          color: 0x00ff00,
-          emissive: 0x00ff00,
-          emissiveIntensity: 2
-        });
-        const arrow = new THREE.Mesh(arrowGeo, arrowMat);
-        arrow.position.copy(spawnPos).add(new THREE.Vector3(0, 3, 0));
-        arrow.rotation.x = Math.PI / 2;
-        arrow.rotation.z = spawnHeading;
-        scene.add(arrow);
-
-        kart.position.copy(spawnPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
-        kart.rotation.y = spawnHeading;
-        mapReadyRef.current = true;
       },
       undefined,
       () => {},
@@ -378,49 +423,52 @@ export default function Home() {
     window.addEventListener("keydown", onKeyDown);
     window.addEventListener("keyup", onKeyUp);
 
-    gameRef.current = {
-      ...gameRef.current,
-      status: "ready",
-      lap: 1,
-      lapDistance: 0,
-      timeLeft: RACE_SECONDS,
-      speed: 0,
-      displaySpeed: 0,
-      steer: 0,
-      heading: Math.atan2(startTangent.x, startTangent.z),
-      trackIndex: 0,
-      checkpoints: [false, false, false, false],
-      lastNearStart: false,
-      playerPos: startPoint,
-      hudTimer: 0,
-      cleanup: () => {},
-    };
-    lastGroundY = startPoint.y;
+    gameRef.current = createInitialGameState(
+      startPoint.clone(),
+      Math.atan2(startTangent.x, startTangent.z),
+    );
 
     kart.position.copy(startPoint).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
 
     let frameId = 0;
     let prev = performance.now();
+    let blurAmount = 0;
 
     const tick = (now: number) => {
       const dt = Math.min((now - prev) / 1000, 0.05);
       prev = now;
       const game = gameRef.current;
+      const frameStartPos = game.playerPos.clone();
 
       if (game.status === "racing") {
-        const steerInput =
-          (keys.has("arrowright") || keys.has("a") ? 1 : 0) -
-          (keys.has("arrowleft") || keys.has("d") ? 1 : 0);
-        const steerResponse = steerInput === 0 ? 9.5 : 4.6;
-        const steerAlpha = 1 - Math.exp(-steerResponse * dt);
-        game.steer = THREE.MathUtils.lerp(game.steer, steerInput, steerAlpha);
-
         const accelInput = keys.has("arrowup") || keys.has("w") ? 1 : 0;
         const brakeInput = keys.has("arrowdown") || keys.has("s") ? 1 : 0;
         const maxSpeed = MAX_DRIVE_SPEED;
+        const steerSpeedFactor = THREE.MathUtils.clamp(game.speed / maxSpeed, 0, 1);
+        const canSteer = game.speed > MIN_STEER_SPEED || accelInput > 0;
+        const steerInput =
+          canSteer
+            ? (keys.has("arrowright") || keys.has("a") ? 1 : 0) -
+              (keys.has("arrowleft") || keys.has("d") ? 1 : 0)
+            : 0;
+        const steerResponse = steerInput === 0
+          ? THREE.MathUtils.lerp(11.5, 7.2, steerSpeedFactor)
+          : THREE.MathUtils.lerp(6.2, 4.1, steerSpeedFactor);
+        const steerAlpha = 1 - Math.exp(-steerResponse * dt);
+        game.steer = THREE.MathUtils.lerp(game.steer, steerInput, steerAlpha);
+        if (steerInput === 0 && game.speed > 0.1) {
+          const selfAlign = 1 - Math.exp(-(2.8 + steerSpeedFactor * 4.2) * dt);
+          game.steer = THREE.MathUtils.lerp(game.steer, 0, selfAlign);
+        }
         
+        const previousHeading = game.heading;
         game.speed = updateCarSpeed(game.speed, accelInput, brakeInput, dt, DEFAULT_PHYSICS);
         game.heading = updateCarHeading(game.heading, game.steer, game.speed, dt, DEFAULT_PHYSICS);
+        const headingStep = Math.atan2(
+          Math.sin(game.heading - previousHeading),
+          Math.cos(game.heading - previousHeading),
+        );
+        const yawRate = headingStep / Math.max(dt, 1e-4);
         const velocity = calculateVelocity(game.heading, game.speed);
         const moveVector = velocity.clone().multiplyScalar(dt);
         const moveDistance = moveVector.length();
@@ -457,7 +505,6 @@ export default function Home() {
                     continue;
                   }
                   game.playerPos.lerp(recoverHit, 0.55);
-                  lastGroundY = recoverHit.y;
                   recovered = true;
                   break;
                 }
@@ -468,12 +515,13 @@ export default function Home() {
                 continue;
               }
               game.playerPos.lerp(roadPoint, 0.75);
-              lastGroundY = roadPoint.y;
             } else {
               game.playerPos.copy(stepTarget);
             }
           }
         }
+
+        game.lapTravel += frameStartPos.distanceTo(game.playerPos);
 
         game.timeLeft = Math.max(0, game.timeLeft - dt);
         game.trackIndex = nearestTrackIndex(track, game.playerPos, game.trackIndex);
@@ -492,18 +540,38 @@ export default function Home() {
           1 - Math.exp(-DISPLAY_SPEED_RESPONSE * dt),
         );
 
-        game.lapDistance = track.cumulativeLengths[game.trackIndex];
+        const lapDeltaIndex =
+          (game.trackIndex - game.lapStartIndex + SAMPLE_COUNT) % SAMPLE_COUNT;
+        const lapProgressIndex =
+          game.lapDirection >= 0
+            ? lapDeltaIndex
+            : (SAMPLE_COUNT - lapDeltaIndex) % SAMPLE_COUNT;
+
+        const absDistance = track.cumulativeLengths[game.trackIndex];
+        const forwardDistance =
+          (absDistance - game.lapStartDistance + track.totalLength) % track.totalLength;
+        const reverseDistance =
+          (game.lapStartDistance - absDistance + track.totalLength) % track.totalLength;
+        game.lapDistance = game.lapDirection >= 0 ? forwardDistance : reverseDistance;
         const checkpointThresholds = [0.2, 0.45, 0.7, 0.9];
         for (let i = 0; i < checkpointThresholds.length; i += 1) {
-          if (game.trackIndex >= Math.floor(SAMPLE_COUNT * checkpointThresholds[i])) {
+          if (lapProgressIndex >= Math.floor(SAMPLE_COUNT * checkpointThresholds[i])) {
             game.checkpoints[i] = true;
           }
         }
 
-        const nearStart = game.trackIndex < 8;
-        if (!game.lastNearStart && nearStart && game.checkpoints.every(Boolean) && game.speed > 8) {
+        const nearStart = lapProgressIndex < 8;
+        const lapDistanceThreshold = track.totalLength * LAP_DISTANCE_THRESHOLD_FACTOR;
+        if (
+          !game.lastNearStart &&
+          nearStart &&
+          game.checkpoints.every(Boolean) &&
+          game.speed > 8 &&
+          game.lapTravel >= lapDistanceThreshold
+        ) {
           game.lap += 1;
           game.checkpoints = [false, false, false, false];
+          game.lapTravel = 0;
           setLap(Math.min(game.lap, TOTAL_LAPS));
           if (game.lap > TOTAL_LAPS) {
             game.status = "won";
@@ -512,9 +580,40 @@ export default function Home() {
         }
         game.lastNearStart = nearStart;
 
+        const speedFactor = THREE.MathUtils.clamp(game.speed / maxSpeed, 0, 1);
+        const accelDelta = (game.speed - game.prevSpeed) / Math.max(dt, 1e-4);
+        game.prevSpeed = game.speed;
+
+        const targetRoll = THREE.MathUtils.clamp(
+          -game.steer * (0.035 + speedFactor * 0.13),
+          -0.16,
+          0.16,
+        );
+        const targetPitch = THREE.MathUtils.clamp(
+          accelDelta > 0
+            ? -Math.min(0.06, accelDelta * 0.0038)
+            : Math.min(0.07, -accelDelta * 0.0045),
+          -0.08,
+          0.08,
+        );
+        const targetYawOffset = THREE.MathUtils.clamp(
+          -yawRate * (0.006 + speedFactor * 0.0035),
+          -0.07,
+          0.07,
+        );
+
+        game.visualRoll = THREE.MathUtils.lerp(game.visualRoll, targetRoll, 1 - Math.exp(-8.5 * dt));
+        game.visualPitch = THREE.MathUtils.lerp(game.visualPitch, targetPitch, 1 - Math.exp(-6.8 * dt));
+        game.visualYawOffset = THREE.MathUtils.lerp(
+          game.visualYawOffset,
+          targetYawOffset,
+          1 - Math.exp(-7.2 * dt),
+        );
+
         kart.position.copy(game.playerPos).add(new THREE.Vector3(0, CAR_RIDE_HEIGHT, 0));
-        kart.rotation.y = game.heading;
-        kart.rotation.z = -game.steer * 0.08;
+        kart.rotation.x = game.visualPitch;
+        kart.rotation.y = game.heading + game.visualYawOffset;
+        kart.rotation.z = game.visualRoll;
 
         updateCamera(camera, game.playerPos, game.heading, game.speed, maxSpeed, game.steer, dt);
 
@@ -532,7 +631,10 @@ export default function Home() {
         }
       }
 
-      renderer.render(scene, camera);
+      blurAmount = updateSpeedBlurAmount(blurAmount, game.speed, MAX_DRIVE_SPEED, dt);
+      speedBlurPass.uniforms.amount.value = blurAmount;
+
+      composer.render();
       frameId = requestAnimationFrame(tick);
     };
 
@@ -545,6 +647,7 @@ export default function Home() {
       camera.aspect = mount.clientWidth / mount.clientHeight;
       camera.updateProjectionMatrix();
       renderer.setSize(mount.clientWidth, mount.clientHeight);
+      composer.setSize(mount.clientWidth, mount.clientHeight);
     };
 
     window.addEventListener("resize", onResize);
@@ -556,6 +659,7 @@ export default function Home() {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("resize", onResize);
+      composer.dispose();
       renderer.dispose();
       mount.removeChild(renderer.domElement);
     };

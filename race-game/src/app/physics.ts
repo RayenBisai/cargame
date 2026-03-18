@@ -11,10 +11,10 @@ export interface PhysicsConfig {
 }
 
 export const DEFAULT_PHYSICS: PhysicsConfig = {
-  accel: 16,
-  brake: 32,
+  accel: 13,
+  brake: 15,
   drag: 7,
-  maxSpeed: 38,
+  maxSpeed: 33,
   steerRate: 1.5,
   movementStepSize: 2.0,     // Balanced: smooth collisions without too much overhead
   positionLerpFactor: 0.85,  // Fluid motion
@@ -47,7 +47,12 @@ export function updateCarHeading(
   dt: number,
   config: PhysicsConfig
 ): number {
-  return heading + steerInput * config.steerRate * dt * (0.25 + speed / config.maxSpeed);
+  const speedRatio = THREE.MathUtils.clamp(speed / Math.max(config.maxSpeed, 0.001), 0, 1);
+  const baseTurn = 0.2 + speedRatio;
+  const lowSpeedGrip = THREE.MathUtils.lerp(1.22, 1.0, speedRatio);
+  const highSpeedSlip = THREE.MathUtils.lerp(1.0, 0.88, THREE.MathUtils.smoothstep(speedRatio, 0.7, 1.0));
+
+  return heading + steerInput * config.steerRate * dt * baseTurn * lowSpeedGrip * highSpeedSlip;
 }
 
 export function calculateVelocity(heading: number, speed: number): THREE.Vector3 {
